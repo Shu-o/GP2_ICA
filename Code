@@ -1,0 +1,158 @@
+# download data and QC
+
+```bash
+# activate conda environment
+source /home/systools/anaconda3/bin/activate upstr
+# cd to working directory
+cd /home/storage_4/GP_ICA
+#  download data
+mkdir 00_rawdata
+scp testing01@10.105.100.153:/public/workspace/chaochenwang/Course/GP2_ICA_ChIPSeq_data/2022/* ./00_rawdata
+# QC
+mkdir 01_quanlitycontrol
+source /home/systools/anaconda3/bin/activate upstr
+fastqc 00_rawdata/* -o 01_quanlitycontrol/ -t 12
+# Download to local to view 
+scp -r root@10.109.92.83:/home/storage_4/GP_ICA/01_quanlitycontrol ./
+
+# MultiQC
+mkdir MultiQC
+multiqc 00_rawdata/ -o ~/MultiQC
+```
+
+Adapter sequences are short oligonucleotides used to be ligated to the ends of DNA fragments of interest, **so that they can be combined with primers for amplification.**
+
+# trim
+
+```bash
+mkdir 02_trimmed
+mkdir 03_QC2
+trim_galore --phred64 --fastqc --length 25 --trim-n --stringency 3 -o 02_trimmed --cores 16 ./00_rawdata/*
+```
+
+# alignment
+
+```bash
+mkdir 04_aligned2
+index=/home/storage_4/GP_ICA/annotation/mm10/bowtie/mm10
+for i in H3K27ac H3K27me3 H3K4me1 H3K4me3 Input POLR2A
+do 
+zcat 02_trimmed/${i}_trimmed.fq.gz |
+bowtie -S --phred64-quals --threads 32 -l 15 -q -x $index - |
+samtools sort -@ 16 > 04_aligned2/${i}_sorted.bam
+samtools index -@ 16 04_aligned2/${i}_sorted.bam
+echo "$i done."
+done
+```
+
+## QC for bam
+
+```bash
+*# QC*mkdir 05_bamQC
+ls 04_aligned/*bam | while read i
+do 
+samtools flagstat -@ 4 $i > 05_bamQC/$(basename $i ".bam").flagstat
+done
+*# 查看比对成功率*
+realpath 05_bamQC/* | xargs head -n 5
+```
+
+
+```bash
+mkdir 06_rmdup
+ls 04_aligned | while read i
+do
+sambamba markdup --remove-duplicates --nthreads=16 --show-progress 04_aligned/${i} 06_rmdup/$(basename $i ".bam")_rmdup.bam
+done
+```
+
+# make tag directory
+
+```bash
+mkdir 08_tag
+for i in 04_aligned/*.bam
+do
+makeTagDirectory 08_tag/$(basename -s _sorted.bam $i)_td $i -format sam -unique
+done
+```
+
+# peak calling using MACS
+
+- The reads distribution of histone modification ChIP-Seq data usually obeys a continuous property, which is different from that of most TF ChIP-Seq data. When applying MACS to ChIP-Seq data with broad peaks, two advanced parameters should be set properly. First, such data increase the difficulty to build robust shifting size model, therefore it is recommended to skip the model building step by setting --*nomodel* in the command line. Second, the estimation of dynamic background works well for histone modification ChIP-Seq data with control. However, if no control data is available for ChIP-Seq data with broad peaks, the local background estimation should be skipped via setting --*nolambda* in the command line.
+
+```bash
+mkdir 07_peak
+for i in POLR2A
+do
+macs2 callpeak -f BAM --keep-dup auto -g mm -n $i --outdir ./07_peak -t 04_aligned/${i}_sorted.bam -c 04_aligned/Input_sorted.bam
+done
+ 
+for i in H3K27ac H3K4me1 H3K4me3 
+do
+macs2 callpeak -f BAM --keep-dup auto -g mm --nomodel -n $i --outdir ./07_peak -t 04_aligned/${i}_sorted.bam -c 04_aligned/Input_sorted.bam
+done
+
+for i in H3K27me3
+do
+macs2 callpeak -f BAM --broad --broad-cutoff 0.1 -q 0.1 --keep-dup auto -g mm --nomodel -n $i --outdir ./07_peak -t 04_aligned/${i}_sorted.bam -c 04_aligned/Input_sorted.bam
+done
+```
+
+# Motif search
+
+```bash
+mkdir 09_motif
+# merge multiple peak file
+cd 07_peak
+mergePeaks -prefix Merged H3K4me1_peaks.narrowPeak H3K27ac_peaks.narrowPeak
+mergePeaks -prefix Merged H3K4me3_peaks.narrowPeak H3K27ac_peaks.narrowPeak
+
+for i in 07_peak/*Peak
+do
+findMotifsGenome.pl $i mm10 09_motif/$(basename $i)_motif -mask -p 32 -size given
+done
+```
+
+# Peak annotation
+
+```bash
+mkdir 10_peakAnn
+
+# get peak density distribution around genes
+makeMetaGeneProfile.pl rna mm10 -d 08_tag/* > 10_peakAnn/metaGeneProfile.txt
+
+# annotate POLR2A peaks for pie chart drawing
+annotatePeaks.pl 07_peak/POLR2A_peaks.narrowPeak mm10 > POL2A_annot.txt
+
+# POLR2A vinicity histone modification
+annotatePeaks.pl 07_peak/POLR2A_peaks.narrowPeak mm10 -size 6000 -hist 25 -cpu 16 -d 08_tag/* > 10_peakAnn/POLR2A_histoneModification.txt
+```
+
+# TSS heatmap
+
+## make bigwig file
+
+```bash
+mkdir 11_bw
+for i in H3K27ac H3K27me3 H3K4me1 H3K4me3 POLR2A
+do 
+bamCompare -b1 06_rmdup/${i}_sorted_rmdup.bam -b2 06_rmdup/Input_sorted_rmdup.bam -o 11_bw/${i}.bw --smoothLength 60 --extendReads 150 --centerReads -p 36
+echo "$i done"
+done
+```
+
+## compute matrix
+
+```bash
+mkdir 12_matrix
+
+# 19:21 - 19:33
+computeMatrix reference-point --referencePoint TSS -b 3000 -a 3000 \
+															--skipZeros -p 32 --verbose \
+															-S 11_bw/H3K27ac.bw 11_bw/H3K4me3.bw 11_bw/H3K4me1.bw 11_bw/H3K27me3.bw 11_bw/POLR2A.bw \
+															-R /home/storage_4/GP_ICA/annotation/mm10.bed \
+															-o matrix.mat.gz
+
+# 19:40 -
+plotHeatmap --kmeans 2 -m matrix.mat.gz -out sampleHeatmap.png
+```
